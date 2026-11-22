@@ -102,7 +102,7 @@ class Receiver:
             reason = RDTSegment.validate(data)
             if reason is not None:
                 seq = int.from_bytes(data[:4], "big")
-                if reason == "checksum":
+                if reason == "checksum": # just logging
                     segment.traceCorrupt(seq)
                 else:
                     segment.traceDrop(seq, reason)
@@ -114,22 +114,21 @@ class Receiver:
             segment.traceRecv(seg, expected, expected, free)
 
             if seg.isAck or seg.isFin:
-                continue  # Task 1 handles incoming data segments.
+                continue  # we dont care about this
 
             if seg.seqNum == segment.mask(expected):
                 if not self.buffer.putSeqNum(seg, expected):
                     segment.traceDrop(seg.seqNum, "window")
                     continue
-            elif expected > 0 and seg.seqNum == segment.mask(expected - 1):
-                segment.traceDrop(seg.seqNum, "dup")
-                # Fall through and ACK this segment again.
+                expected += 1
             else:
                 segment.traceDrop(seg.seqNum, "window")
-                continue
+                if expected == 0:
+                    continue
 
             free = self.buffer.freeSlots()
             ack = RDTSegment(
-                ackNum=seg.seqNum,
+                ackNum=expected - 1,
                 flags=segment.FLAG_ACK,
                 rcvWin=free,
             )

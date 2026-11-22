@@ -114,6 +114,10 @@ class Sender:
                 data, _ = self.sock.recvfrom(UDP_READ_SIZE)
             except socket.timeout:
                 data = None
+            except OSError: # DONT LOOK
+                if self.sock.fileno() == -1: # this prevents giant error message when program shuts down
+                    return
+                raise
 
             with self.buffer.cv:
                 base = self.buffer.base
