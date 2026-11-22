@@ -21,7 +21,7 @@ import config
 # Set this to your Canvas group number before you run anything else. It is the
 # seed for every run you report, and channel.py reads it from this file, so the
 # three programs can never disagree about it.
-SEED = 0
+SEED = 24
 
 HEADER = "!IIBxHHH"  # seqNum, ackNum, flags, pad, checksum, rcvWin, length
 HEADER_LEN = struct.calcsize(HEADER)
@@ -44,7 +44,18 @@ def checksum(data):
     Running this over a whole datagram exactly as received, checksum field
     included, gives zero if and only if nothing changed in transit.
     """
-    raise NotImplementedError
+    total = 0
+    # Pad with a zero byte if the length is odd
+    if len(data) % 2 == 1:
+        data += b'\x00'
+    # Sum 16-bit words
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        total += word
+        # Fold carry
+        total = (total & 0xFFFF) + (total >> 16)
+    # One's complement
+    return ~total & 0xFFFF
 
 
 class RDTSegment:
@@ -97,7 +108,23 @@ class RDTSegment:
         a damaged length field is a corruption, and the two are otherwise
         indistinguishable.
         """
-        raise NotImplementedError
+        # Check checksum
+        if checksum(data) != 0:
+            return "checksum"
+
+        # Prevent unpack from failing on invalid data
+        if len(data) < HEADER_LEN:
+            return "length"
+
+        _, _, flags, _, _, length = struct.unpack(HEADER, data[:HEADER_LEN])
+
+        if flags & FLAG_RESERVED:
+            return "flags"
+
+        if length != len(data) - HEADER_LEN:
+            return "length"
+
+        return None
 
     @property
     def isAck(self):
@@ -299,8 +326,16 @@ class RdtBuffer:
         Follow putNext: take the Condition, wait_for the state you need, change
         it, notify_all, release.
         """
-        raise NotImplementedError
-
+        with self.cv:
+            has_segment = self.cv.wait_for(
+                lambda: self.closed or self.slots[self.base % self.size] is not None, timeout)
+            if not has_segment or self.closed:
+                return None
+            seg = self.slots[self.base % self.size]
+            self.slots[self.base % self.size] = None
+            self.base += 1
+            self.cv.notify_all()
+            return seg
     def putSeqNum(self, seg, index):
         """Place a segment at a logical index that may be ahead of `base`.
 
@@ -320,7 +355,16 @@ class RdtBuffer:
         rdtReceiver.py. Placing a segment at the wrong index is therefore not a
         local mistake: it delivers the file in the wrong order.
         """
-        raise NotImplementedError
+        with self.cv:
+            if not self.base <= index < self.base + self.size:
+                return False
+            if self.slots[index % self.size] is not None:
+                return False
+            self.slots[index % self.size] = seg
+            if index >= self.next:
+                self.next = index + 1
+            self.cv.notify_all()
+            return True
 
     def markAcked(self, index):
         """Flag the segment at `index`, then slide base past a run of acked slots.
@@ -341,7 +385,18 @@ class RdtBuffer:
         which is why one call can free several slots and wake an application
         thread that has been blocked in putNext.
         """
-        raise NotImplementedError
+        with self.cv:
+            if not self.base <= index < self.next:
+                return False
+            seg = self.slots[index % self.size]
+            if seg is None:
+                return False
+            seg.acked = True
+            while self.base < self.next and self.slots[self.base % self.size] is not None and self.slots[self.base % self.size].acked:
+                self.slots[self.base % self.size] = None
+                self.base += 1
+            self.cv.notify_all()
+            return True
 
 
 # ============================================================================
