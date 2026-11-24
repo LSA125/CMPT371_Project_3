@@ -19,6 +19,10 @@ import segment
 from segment import RDTSegment, RdtBuffer
 
 
+UDP_READ_SIZE = 65_535
+SOCKET_POLL_SECONDS = 0.005
+
+
 class Sender:
     """One direction of a connection, from the application into the channel.
 
@@ -68,6 +72,8 @@ class Sender:
         self.buffer = RdtBuffer(config.WINDOW)
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+        # self.lock guard
+        self.sent_next = 0
         self.deadline = None
 
     def start(self):
@@ -85,7 +91,6 @@ class Sender:
 
         Do the socket call outside the buffer's Condition, never inside it.
         """
-        SOCKET_POLL_SECONDS = 0.005
         self.sock.settimeout(SOCKET_POLL_SECONDS)
         self.network_thread = threading.Thread(target=self._network_loop)
         self.network_thread.start()
@@ -103,51 +108,69 @@ class Sender:
         """
         with self.buffer.cv:
             index = self.buffer.next
+        seg = RDTSegment(seqNum=segment.mask(index), payload=payload)
+        if not self.buffer.putNext(seg):
+            return False
 
-            seg = RDTSegment(seqNum=segment.mask(index), payload=payload)
-            return self.buffer.putNext(seg)
-        
+        with self.lock:
+            with self.buffer.cv:
+                base = self.buffer.base
+                win = self.buffer.limit
+            self.sock.sendto(seg.pack(), self.channelAddr)
+            self.sent_next = index + 1
+            segment.traceSend(seg, base, self.sent_next, win)
+            if self.deadline is None:
+                self.deadline = time.monotonic() + config.RTO_INIT
+        return True
+
     def _network_loop(self):
         while not self.stop_event.is_set():
             try:
-                UDP_READ_SIZE = 65_535
                 data, _ = self.sock.recvfrom(UDP_READ_SIZE)
             except socket.timeout:
                 data = None
-            except OSError: # DONT LOOK
-                if self.sock.fileno() == -1: # this prevents giant error message when program shuts down
+            except OSError:
+                if self.sock.fileno() == -1:
                     return
                 raise
 
-            with self.buffer.cv:
-                base = self.buffer.base
-                next_seq = self.buffer.next
-                win = self.buffer.limit
-                seg = self.buffer.get(base)
+            ack = None
+            if data is not None:
+                reason = RDTSegment.validate(data)
+                if reason is None:
+                    ack = RDTSegment.unpack(data)
+                elif reason == "checksum":
+                    segment.traceCorrupt(int.from_bytes(data[:4], "big"))
+                else:
+                    segment.traceDrop(int.from_bytes(data[:4], "big"), reason)
 
-            if data is not None and RDTSegment.validate(data) is None:
-                ack = RDTSegment.unpack(data)
-                segment.traceRecv(ack, base, next_seq, win)
+            with self.lock:
+                with self.buffer.cv:
+                    base = self.buffer.base
+                    win = self.buffer.limit
+                if ack is not None:
+                    segment.traceRecv(ack, base, self.sent_next, win)
+                    if ack.isAck and not ack.isFin:
+                        # Map the wire ACK to an index in the transmitted window.
+                        distance = segment.mask(ack.ackNum - segment.mask(base))
+                        last = base + distance
+                        if segment.mask(ack.ackNum) == ack.ackNum and last < self.sent_next:
+                            for index in range(base, last + 1):
+                                self.buffer.markAcked(index)
+                            base = last + 1
+                            self.deadline = None
+                            if base < self.sent_next:
+                                self.deadline = time.monotonic() + config.RTO_INIT
 
-                if (seg is not None and self.deadline is not None
-                        and ack.isAck and not ack.isFin
-                        and ack.ackNum == seg.seqNum):
-                    self.deadline = None
-                    self.buffer.markAcked(base)
+                if self.deadline is None or time.monotonic() < self.deadline:
                     continue
 
-            if seg is None:
-                continue
-
-            now = time.monotonic()
-            if self.deadline is not None:
-                if now < self.deadline:
-                    continue
-                segment.traceTimeout(seg.seqNum, base, next_seq)
-
-            self.sock.sendto(seg.pack(), self.channelAddr)
-            segment.traceSend(seg, base, next_seq, win)
-            self.deadline = time.monotonic() + config.RTO_INIT
+                segment.traceTimeout(segment.mask(base), base, self.sent_next)
+                for index in range(base, self.sent_next):
+                    seg = self.buffer.get(index)
+                    self.sock.sendto(seg.pack(), self.channelAddr)
+                    segment.traceSend(seg, base, self.sent_next, win)
+                self.deadline = time.monotonic() + config.RTO_INIT
 
     def close(self):
         """Wait for every segment to be acknowledged, then take the connection

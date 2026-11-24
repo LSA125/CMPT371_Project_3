@@ -128,7 +128,7 @@ class Receiver:
 
             free = self.buffer.freeSlots()
             ack = RDTSegment(
-                ackNum=expected - 1,
+                ackNum=segment.mask(expected - 1),
                 flags=segment.FLAG_ACK,
                 rcvWin=free,
             )
