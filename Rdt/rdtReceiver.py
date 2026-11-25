@@ -1,4 +1,4 @@
-# Name: <your full name> (<your student number>), <partner> (<their number>)
+# Name: Gavin Burns (301634542), <partner> (<their number>)
 """The receiving half of the protocol: Go-Back-N and Selective Repeat.
 
 Go-Back-N keeps a receive window of one and buffers nothing. Selective Repeat
@@ -117,10 +117,10 @@ class Receiver:
                 continue  # we dont care about this
 
             if seg.seqNum == segment.mask(expected):
-                if not self.buffer.putSeqNum(seg, expected):
+                if self.buffer.putSeqNum(seg, expected):
+                    expected += 1
+                else:
                     segment.traceDrop(seg.seqNum, "window")
-                    continue
-                expected += 1
             else:
                 segment.traceDrop(seg.seqNum, "window")
                 if expected == 0:

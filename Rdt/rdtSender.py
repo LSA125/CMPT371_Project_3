@@ -1,4 +1,4 @@
-# Name: <your full name> (<your student number>), <partner> (<their number>)
+# Name: Gavin Burns (301634542), <partner> (<their number>)
 """The sending half of the protocol: Go-Back-N and Selective Repeat.
 
 Stop-and-wait is Go-Back-N with a window of one, so build task 1 in a way that
@@ -109,8 +109,12 @@ class Sender:
         with self.buffer.cv:
             index = self.buffer.next
         seg = RDTSegment(seqNum=segment.mask(index), payload=payload)
-        if not self.buffer.putNext(seg):
-            return False
+        while not self.buffer.putNext(seg, timeout=config.PERSIST):
+            with self.buffer.cv:
+                stalled = self.buffer.limit == 0 and self.buffer.next == self.buffer.base
+            if stalled:
+                self.buffer.putNext(seg, force=True)
+                break
 
         with self.lock:
             with self.buffer.cv:
@@ -145,12 +149,14 @@ class Sender:
                     segment.traceDrop(int.from_bytes(data[:4], "big"), reason)
 
             with self.lock:
+                if (just_ack := ack is not None and ack.isAck):
+                    self.buffer.setLimit(min(config.WINDOW, ack.rcvWin))
                 with self.buffer.cv:
                     base = self.buffer.base
                     win = self.buffer.limit
                 if ack is not None:
                     segment.traceRecv(ack, base, self.sent_next, win)
-                    if ack.isAck and not ack.isFin:
+                    if just_ack and not ack.isFin:
                         # Map the wire ACK to an index in the transmitted window.
                         distance = segment.mask(ack.ackNum - segment.mask(base))
                         last = base + distance
