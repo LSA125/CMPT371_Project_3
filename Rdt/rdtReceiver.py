@@ -20,6 +20,8 @@ import config
 import segment
 from segment import RDTSegment, RdtBuffer
 
+#The text said it was "defensible"
+LINGER_SECONDS = 2 * config.RTO_INIT
 
 class Receiver:
     """One direction of a connection, from the channel into the application.
@@ -56,6 +58,7 @@ class Receiver:
         self.buffer = RdtBuffer(config.RCV_BUF)
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.last_fin = None
 
     def start(self):
         """Start the network thread.
@@ -73,6 +76,7 @@ class Receiver:
         flow control in task 3 exists to prevent. Keep the socket call and the
         delivery outside the buffer's Condition and it stays survivable.
         """
+        self.sock.settimeout(0.05)
         self.network_thread = threading.Thread(target=self._network_loop)
         self.network_thread.start()
 
@@ -83,17 +87,23 @@ class Receiver:
         has been handed over. Each segment must be returned exactly once, ever,
         however many times it arrives.
         """
-        seg = self.buffer.getNext(timeout=None)
-        if seg is None:
-            return None
-        segment.traceDeliver(seg.seqNum, len(seg.payload))
-        return seg.payload
+        while True:
+            seg = self.buffer.getNext(timeout=0.05)
+            if seg is not None:
+                segment.traceDeliver(seg.seqNum, len(seg.payload))
+                return seg.payload
+            with self.lock:
+                fin_seen = self.last_fin is not None
+            if fin_seen and self.buffer.outstanding() == 0:
+                return None
     
     def _network_loop(self):
-        while True:
+        UDP_READ_SIZE = 65_535
+        while not self.stop_event.is_set():
             try:
-                UDP_READ_SIZE = 65_535
                 data, _ = self.sock.recvfrom(UDP_READ_SIZE)
+            except (socket.timeout, ConnectionResetError):
+                continue
             except OSError:
                 if self.sock.fileno() == -1:
                     return
@@ -113,8 +123,21 @@ class Receiver:
             free = self.buffer.freeSlots()
             segment.traceRecv(seg, expected, expected, free)
 
-            if seg.isAck or seg.isFin:
-                continue  # we dont care about this
+            if seg.isAck:
+                continue
+            if seg.isFin:
+                if seg.seqNum != segment.mask(expected):
+                    segment.traceDrop(seg.seqNum, "window")
+                    continue
+                with self.lock:
+                    self.last_fin = time.monotonic()
+                free = self.buffer.freeSlots()
+                reply = RDTSegment(ackNum=seg.seqNum,
+                                   flags=segment.FLAG_ACK | segment.FLAG_FIN,
+                                   rcvWin=free)
+                self.sock.sendto(reply.pack(), self.channelAddr)
+                segment.traceSend(reply, expected, expected, free)
+                continue
 
             if seg.seqNum == segment.mask(expected):
                 if self.buffer.putSeqNum(seg, expected):
@@ -145,7 +168,19 @@ class Receiver:
         left to answer. Wait a bounded time, answer any further FIN, and only
         then return.
         """
-        raise NotImplementedError
+        with self.lock:
+            seen = self.last_fin is not None
+        if not seen:
+            return False
+        while True:
+            with self.lock:
+                remaining = self.last_fin + LINGER_SECONDS - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.02))
+        self.stop_event.set()
+        self.network_thread.join(timeout=1.0)
+        return True
 
 
 # ============================================================================

@@ -21,7 +21,7 @@ from segment import RDTSegment, RdtBuffer
 
 UDP_READ_SIZE = 65_535
 SOCKET_POLL_SECONDS = 0.005
-
+MAX_RETRIES = 20
 
 class Sender:
     """One direction of a connection, from the application into the channel.
@@ -76,6 +76,11 @@ class Sender:
         self.sent_next = 0
         self.deadline = None
 
+        self.failed = None
+        self.timeouts = 0
+        self.fin_seq = None
+        self.fin_acked = threading.Event()
+
     def start(self):
         """Start the network thread.
 
@@ -106,10 +111,14 @@ class Sender:
         reopen it, because there is nothing left to acknowledge. After
         config.PERSIST seconds, transmit anyway.
         """
+
+        if self.failed: return False
+
         with self.buffer.cv:
             index = self.buffer.next
         seg = RDTSegment(seqNum=segment.mask(index), payload=payload)
         while not self.buffer.putNext(seg, timeout=config.PERSIST):
+            if self.failed: return False
             with self.buffer.cv:
                 stalled = self.buffer.limit == 0 and self.buffer.next == self.buffer.base
             if stalled:
@@ -133,6 +142,8 @@ class Sender:
                 data, _ = self.sock.recvfrom(UDP_READ_SIZE)
             except socket.timeout:
                 data = None
+            except ConnectionResetError:
+                data = None
             except OSError:
                 if self.sock.fileno() == -1:
                     return
@@ -151,6 +162,7 @@ class Sender:
             with self.lock:
                 if (just_ack := ack is not None and ack.isAck):
                     self.buffer.setLimit(min(config.WINDOW, ack.rcvWin))
+                    self.timeouts = 0
                 with self.buffer.cv:
                     base = self.buffer.base
                     win = self.buffer.limit
@@ -167,10 +179,18 @@ class Sender:
                             self.deadline = None
                             if base < self.sent_next:
                                 self.deadline = time.monotonic() + config.RTO_INIT
+                    elif just_ack and ack.ackNum == self.fin_seq:
+                        self.fin_acked.set()
 
                 if self.deadline is None or time.monotonic() < self.deadline:
                     continue
 
+                self.timeouts += 1
+                if self.timeouts > MAX_RETRIES:
+                    self.failed = "receiver stopped responding"
+                    self.deadline = None
+                    continue
+                
                 segment.traceTimeout(segment.mask(base), base, self.sent_next)
                 for index in range(base, self.sent_next):
                     seg = self.buffer.get(index)
@@ -184,7 +204,38 @@ class Sender:
         has been acknowledged. Return False if the connection could not be
         closed. Must return within a bounded time in either case.
         """
-        raise NotImplementedError
+
+        # wait for every segment to be acked
+        while True:
+            with self.buffer.cv:
+                if self.buffer.next == self.buffer.base:
+                    break
+                self.buffer.cv.wait(timeout=0.05)
+            if self.failed:
+                return self._finish(False)
+
+        with self.buffer.cv:
+            index = self.buffer.next
+        fin = RDTSegment(seqNum=segment.mask(index), flags=segment.FLAG_FIN)
+        with self.lock:
+            self.fin_seq = fin.seqNum
+
+        for _ in range(MAX_RETRIES):
+            with self.buffer.cv:
+                win = self.buffer.limit
+            self.sock.sendto(fin.pack(), self.channelAddr)
+            segment.traceSend(fin, index, index, win)
+            if self.fin_acked.wait(timeout=config.RTO_INIT):
+                return self._finish(True)
+            segment.traceTimeout(fin.seqNum, index, index)
+
+        self.failed = "FIN was never acknowledged"
+        return self._finish(False)
+
+    def _finish(self, ok):
+        self.stop_event.set()
+        self.network_thread.join(timeout=1.0)
+        return ok
 
 
 # ============================================================================
